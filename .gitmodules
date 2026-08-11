@@ -1,0 +1,3 @@
+[submodule "thirdparty/ripe"]
+	path = thirdparty/ripe
+	url = https://github.com/fraunhoferhhi/RIPE.git
