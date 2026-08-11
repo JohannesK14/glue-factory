@@ -1,0 +1,24 @@
+model:
+    name: two_view_pipeline
+    extractor:
+        name: extractors.ripe
+        threshold: 1.0
+        top_k: 2048
+    matcher:
+        name: matchers.nearest_neighbor_matcher
+benchmarks:
+    megadepth1500:
+      data:
+        preprocessing:
+          side: long
+          resize: 1600
+      eval:
+        estimator: poselib
+        ransac_th: 0.5
+    hpatches:
+      eval:
+        estimator: poselib
+        ransac_th: 0.5
+      model:
+        extractor:
+          top_k: 1024  # overwrite config above
