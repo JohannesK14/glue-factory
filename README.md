@@ -1,3 +1,17 @@
+# RIPE Evaluation with the Glue Factory
+
+This is a fork of the [GlueFactory](https://github.com/cvg/glue-factory) repository with [RIPE](https://github.com/fraunhoferhhi/RIPE) integrated for evaluation.
+
+To ensure reproducibility, this fork uses [uv](https://docs.astral.sh/uv/) to manage the environment.
+
+To evaluate RIPE on MegaDepth1500 and HPatches, run (after installing uv):
+
+```bash
+uv sync
+uv run python -m gluefactory.eval.megadepth1500 --conf ripe+NN
+uv run python -m gluefactory.eval.hpatches --conf ripe+NN
+```
+
 # Glue Factory
 Glue Factory is CVG's library for training and evaluating deep neural network that extract and match local visual feature. It enables you to:
 - Reproduce the training of state-of-the-art models for point and line matching, like [LightGlue](https://github.com/cvg/LightGlue) and [GlueStick](https://github.com/cvg/GlueStick) (ICCV 2023)
