@@ -12,6 +12,28 @@ uv run python -m gluefactory.eval.megadepth1500 --conf ripe+NN
 uv run python -m gluefactory.eval.hpatches --conf ripe+NN
 ```
 
+For RIPE++
+```bash
+uv sync
+uv run python -m gluefactory.eval.megadepth1500 --conf ripepp+NN
+uv run python -m gluefactory.eval.hpatches --conf ripepp+NN
+```
+
+Recreate SCARED1500:
+1. Download SCARED (write an e-mail to max.allan@intusurg.com)
+2. Use the preprocessing scripts from https://github.com/fraunhoferhhi/RIPEpp
+3. Recreate the dataset with:
+
+```bash
+uv run python -m gluefactory.scripts.recreate_scared1500 --input ./path/to/raw/SCARED/dataset --source ./assets/scared1500_manifest/ --output ./data/scared1500
+```
+It is also possible to create a new evaluation dataset with `gluefactory/scripts/create_scared1500.py`.
+
+4. Run evalution with:
+```bash
+uv run python -m gluefactory.eval.scared1500 --conf ripepp+NN model.extractor.variant=scared
+```
+
 # Glue Factory
 Glue Factory is CVG's library for training and evaluating deep neural network that extract and match local visual feature. It enables you to:
 - Reproduce the training of state-of-the-art models for point and line matching, like [LightGlue](https://github.com/cvg/LightGlue) and [GlueStick](https://github.com/cvg/GlueStick) (ICCV 2023)
