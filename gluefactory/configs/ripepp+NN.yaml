@@ -1,0 +1,37 @@
+model:
+    name: two_view_pipeline
+    extractor:
+        name: extractors.ripepp
+        inference_conf:
+          threshold: 0.5
+          top_k: 2048
+          nms_size: 3
+          subpixel_sampling: true
+        variant: default # could also be "scared" or "aachen_day_night"
+    matcher:
+        name: matchers.nearest_neighbor_matcher
+benchmarks:
+    megadepth1500:
+      data:
+        preprocessing:
+          side: long
+          resize: 1200
+      eval:
+        estimator: poselib
+        ransac_th: 0.5
+    megadepth1500_negative:
+      data:
+        preprocessing:
+          side: long
+          resize: 1200
+      eval:
+        estimator: poselib
+        ransac_th: 0.5
+    hpatches:
+      eval:
+        estimator: poselib
+        ransac_th: 0.5
+      model:
+        extractor:
+          inference_conf: # overwrite config above
+            topper: 1024
