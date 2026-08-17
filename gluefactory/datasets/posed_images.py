@@ -75,6 +75,7 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
         "scene_list": None,
         "preprocessing": ImagePreprocessor.default_conf,
         "batch_size": 1,
+        "num_pairs": None,
     }
 
     def get_image_path(self, scene, img_name):
@@ -104,10 +105,7 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
         for scene in self.scenes:
             scene_view_path = self.root / conf.views.format(scene=scene)
             with open(str(scene_view_path), "r") as f:
-                self.views[scene] = {
-                    line.rstrip().split(" ")[0]: line.rstrip().split(" ")[1:]
-                    for line in f
-                }
+                self.views[scene] = {line.rstrip().split(" ")[0]: line.rstrip().split(" ")[1:] for line in f}
 
             # Check if images exist
             for imname in self.views[scene].keys():
@@ -118,13 +116,9 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
                     depthpath = self.get_depth_path(scene, imname)
                     assert depthpath.exists(), depthpath
             if conf.extra_data:
-                with open(
-                    str(self.root / conf.extra_data.format(scene=scene)), "r"
-                ) as f:
+                with open(str(self.root / conf.extra_data.format(scene=scene)), "r") as f:
                     self.extra_data[scene] = {
-                        line.rstrip().split(" ")[0]: [
-                            ast.literal_eval(x) for x in line.rstrip().split(" ")[1:]
-                        ]
+                        line.rstrip().split(" ")[0]: [ast.literal_eval(x) for x in line.rstrip().split(" ")[1:]]
                         for line in f
                         if not line.startswith("#")
                     }
@@ -137,6 +131,9 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
                 view_group_path = self.root / conf.view_groups.format(scene=scene)
                 view_groups = view_group_path.read_text().rstrip("\n").split("\n")
                 self.items += [[scene] + p.split(" ") for p in view_groups]
+
+        if conf.num_pairs is not None:
+            self.items = self.items[: conf.num_pairs]
 
         self.preprocessor = ImagePreprocessor(conf.preprocessing)
 
@@ -152,9 +149,7 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
         data["name"] = name
 
         if self.conf.depth_dir:
-            depth = load_depth(
-                self.get_depth_path(scene, name), dformat=self.conf.depth_format
-            )
+            depth = load_depth(self.get_depth_path(scene, name), dformat=self.conf.depth_format)
             data["depth"] = self.preprocessor(
                 depth,
                 interpolation="nearest",
@@ -166,7 +161,7 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
         if self.conf.extra_data:
             data = {
                 **data,
-                **dict(zip(self.conf.extra_keys, self.extra_data[scene][name])),
+                **dict(zip(self.conf.extra_keys, self.extra_data[scene][name], strict=False)),
             }
         return data
 
@@ -184,15 +179,10 @@ class PosedImageDataset(BaseDataset, torch.utils.data.Dataset):
         data["nviews"] = len(image_names)
 
         for i in range(1, data["nviews"]):
-            data[f"T_0to{i}"] = (
-                data[f"view{i}"]["T_w2cam"] @ data["view0"]["T_w2cam"].inv()
-            )
+            data[f"T_0to{i}"] = data[f"view{i}"]["T_w2cam"] @ data["view0"]["T_w2cam"].inv()
 
         def recursive_tolist(d):
-            return {
-                k: [v] if not isinstance(v, dict) else recursive_tolist(v)
-                for k, v in d.items()
-            }
+            return {k: [v] if not isinstance(v, dict) else recursive_tolist(v) for k, v in d.items()}
 
         return data
 
@@ -228,12 +218,7 @@ if __name__ == "__main__":
 
     images, depths = [], []
     for i, data in tqdm(enumerate(loader)):
-        images.append(
-            [
-                data[f"view{i}"]["image"][0].permute(1, 2, 0)
-                for i in range(data["nviews"][0])
-            ]
-        )
+        images.append([data[f"view{i}"]["image"][0].permute(1, 2, 0) for i in range(data["nviews"][0])])
         depths.append([data[f"view{i}"]["depth"][0] for i in range(data["nviews"][0])])
         if i > 3:
             break

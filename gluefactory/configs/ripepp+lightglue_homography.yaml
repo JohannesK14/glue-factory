@@ -1,0 +1,65 @@
+data:
+    name: homographies
+    data_dir: revisitop1m
+    train_size: 150000
+    val_size: 2000
+    batch_size: 128
+    num_workers: 14
+    homography:
+        difficulty: 0.7
+        max_angle: 45
+    photometric:
+        name: lg
+data_val:
+    name: homographies
+    data_dir: revisitop1m
+    train_size: 150000
+    val_size: 2000
+    batch_size: 64 # important, as validation is not affected by mixed precision setting
+    num_workers: 14
+    homography:
+        difficulty: 0.7
+        max_angle: 45
+    photometric:
+        name: lg
+model:
+    name: two_view_pipeline
+    extractor:
+        name: extractors.ripepp
+        inference_conf:
+          threshold: 0.5
+          top_k: 512
+          nms_size: 3
+          subpixel_sampling: true
+        variant: default
+    ground_truth:
+        name: matchers.homography_matcher
+        th_positive: 3
+        th_negative: 3
+    matcher:
+        name: matchers.lightglue
+        filter_threshold: 0.1
+        flash: false
+        checkpointed: true
+train:
+    run_from_previous: null
+    logger:
+        project_name: ripe+lightglue
+        experiment_name: homography
+        mode: online
+    seed: 0
+    epochs: 40
+    log_every_iter: 100
+    eval_every_iter: 500
+    lr: 1e-4
+    lr_schedule:
+        start: 20
+        type: exp
+        on_epoch: true
+        exp_div_10: 10
+    plot: [5, 'gluefactory.visualization.visualize_batch.make_match_figures']
+benchmarks:
+    hpatches:
+      eval:
+        estimator: opencv
+        ransac_th: 0.5

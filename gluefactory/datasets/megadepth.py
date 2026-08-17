@@ -143,9 +143,7 @@ class _PairDataset(torch.utils.data.Dataset):
             try:
                 info = np.load(str(path), allow_pickle=True)
             except Exception:
-                logger.warning(
-                    "Cannot load scene info for scene %s at %s.", scene, path
-                )
+                logger.warning("Cannot load scene info for scene %s at %s.", scene, path)
                 continue
             self.images[scene] = info["image_paths"]
             self.depths[scene] = info["depth_paths"]
@@ -192,9 +190,7 @@ class _PairDataset(torch.utils.data.Dataset):
                 )
                 ids = np.where(valid)[0]
                 if num_pos and len(ids) > num_pos:
-                    ids = np.random.RandomState(seed).choice(
-                        ids, num_pos, replace=False
-                    )
+                    ids = np.random.RandomState(seed).choice(ids, num_pos, replace=False)
                 ids = [(scene, i) for i in ids]
                 self.items.extend(ids)
         else:
@@ -212,9 +208,7 @@ class _PairDataset(torch.utils.data.Dataset):
                     # Sample a subset of pairs, binned by overlap.
                     num_bins = self.conf.num_overlap_bins
                     assert num_bins > 0
-                    bin_width = (
-                        self.conf.max_overlap - self.conf.min_overlap
-                    ) / num_bins
+                    bin_width = (self.conf.max_overlap - self.conf.min_overlap) / num_bins
                     num_per_bin = num_pos // num_bins
                     pairs_all = []
                     for k in range(num_bins):
@@ -227,14 +221,12 @@ class _PairDataset(torch.utils.data.Dataset):
                     has_enough_samples = [len(p) >= num_per_bin * 2 for p in pairs_all]
                     num_per_bin_2 = num_pos // max(1, sum(has_enough_samples))
                     pairs = []
-                    for pairs_bin, keep in zip(pairs_all, has_enough_samples):
+                    for pairs_bin, keep in zip(pairs_all, has_enough_samples, strict=False):
                         if keep:
                             pairs.append(sample_n(pairs_bin, num_per_bin_2, seed))
                     pairs = np.concatenate(pairs, 0)
                 else:
-                    pairs = (mat > self.conf.min_overlap) & (
-                        mat <= self.conf.max_overlap
-                    )
+                    pairs = (mat > self.conf.min_overlap) & (mat <= self.conf.max_overlap)
                     pairs = np.stack(np.where(pairs), -1)
 
                 pairs = [(scene, ind[i], ind[j], mat[i, j]) for i, j in pairs]
@@ -260,15 +252,11 @@ class _PairDataset(torch.utils.data.Dataset):
             img = load_image(self.root / self.images[scene][idx], self.conf.grayscale)
         else:
             size = PIL.Image.open(path).size[::-1]
-            img = torch.zeros(
-                [3 - 2 * int(self.conf.grayscale), size[0], size[1]]
-            ).float()
+            img = torch.zeros([3 - 2 * int(self.conf.grayscale), size[0], size[1]]).float()
 
         # read depth
         if self.conf.read_depth:
-            depth_path = (
-                self.root / self.conf.depth_subpath / scene / (path.stem + ".h5")
-            )
+            depth_path = self.root / self.conf.depth_subpath / scene / (path.stem + ".h5")
             with h5py.File(str(depth_path), "r") as f:
                 depth = f["/depth"].__array__().astype(np.float32, copy=False)
                 depth = torch.Tensor(depth)[None]
@@ -293,9 +281,7 @@ class _PairDataset(torch.utils.data.Dataset):
 
         data = self.preprocessor(img)
         if depth is not None:
-            data["depth"] = self.preprocessor(depth, interpolation="nearest")["image"][
-                0
-            ]
+            data["depth"] = self.preprocessor(depth, interpolation="nearest")["image"][0]
         K = scale_intrinsics(K, data["scales"])
 
         data = {
@@ -357,6 +343,8 @@ class _PairDataset(torch.utils.data.Dataset):
             data = self._read_view(scene, idx0)
         data["scene"] = scene
         data["idx"] = idx
+        data["label"] = True  # Dummy label, as this is needed for the calculation of the RL loss during validation
+
         return data
 
     def __len__(self):
@@ -403,9 +391,7 @@ class _TripletDataset(_PairDataset):
                             if good[i1, i2]:
                                 triplets.append((i0, i1, i2))
                     if len(triplets) > num:
-                        selected = np.random.RandomState(seed).choice(
-                            len(triplets), num, replace=False
-                        )
+                        selected = np.random.RandomState(seed).choice(len(triplets), num, replace=False)
                         selected = range(num)
                         triplets = np.array(triplets)[selected]
                 else:
@@ -415,21 +401,16 @@ class _TripletDataset(_PairDataset):
                     good = good[non_unique]
                     pairs = np.stack(np.where(good), -1)
                     if len(pairs) > num:
-                        selected = np.random.RandomState(seed).choice(
-                            len(pairs), num, replace=False
-                        )
+                        selected = np.random.RandomState(seed).choice(len(pairs), num, replace=False)
                         pairs = pairs[selected]
                     for idx, (k, i) in enumerate(pairs):
                         # We now sample a j from row k s.t. i != j
                         possible_j = np.where(good[k])[0]
                         possible_j = possible_j[possible_j != i]
-                        selected = np.random.RandomState(seed + idx).choice(
-                            len(possible_j), 1, replace=False
-                        )[0]
+                        selected = np.random.RandomState(seed + idx).choice(len(possible_j), 1, replace=False)[0]
                         triplets.append((ind_r[k], i, possible_j[selected]))
                     triplets = [
-                        (scene, ind[k], ind[i], ind[j], mat[k, i], mat[k, j], mat[i, j])
-                        for k, i, j in triplets
+                        (scene, ind[k], ind[i], ind[j], mat[k, i], mat[k, j], mat[i, j]) for k, i, j in triplets
                     ]
                     self.items.extend(triplets)
         np.random.RandomState(seed).shuffle(self.items)
@@ -481,16 +462,9 @@ def visualize(args):
 
     with fork_rng(seed=dataset.conf.seed):
         images, depths = [], []
-        for _, data in zip(range(args.num_items), loader):
-            images.append(
-                [
-                    data[f"view{i}"]["image"][0].permute(1, 2, 0)
-                    for i in range(dataset.conf.views)
-                ]
-            )
-            depths.append(
-                [data[f"view{i}"]["depth"][0] for i in range(dataset.conf.views)]
-            )
+        for _, data in zip(range(args.num_items), loader, strict=False):
+            images.append([data[f"view{i}"]["image"][0].permute(1, 2, 0) for i in range(dataset.conf.views)])
+            depths.append([data[f"view{i}"]["depth"][0] for i in range(dataset.conf.views)])
 
     axes = plot_image_grid(images, dpi=args.dpi)
     for i in range(len(images)):

@@ -14,6 +14,21 @@ from ..utils.export_predictions import export_predictions
 resize = 1024
 n_kpts = 2048
 configs = {
+    "ripe_entropy": {
+        "name": f"r{resize}_RIPEPP-k{n_kpts}-nms3",
+        "keys": ["keypoints", "descriptors", "keypoint_scores"],
+        "gray": False,
+        "conf": {
+            "name": "extractors.ripepp",
+            "inference_conf": {
+                "subpixel_sampling": True,
+                "nms_size": 3,
+                "top_k": n_kpts,
+                "threshold": 0.5,
+            },
+            "variant": "default",
+        },
+    },
     "sp": {
         "name": f"r{resize}_SP-k{n_kpts}-nms3",
         "keys": ["keypoints", "descriptors", "keypoint_scores"],
@@ -136,9 +151,7 @@ def run_export(feature_file, scene, args):
         keys = keys + ["depth_keypoints", "valid_depth_keypoints"]
     else:
         callback_fn = None
-    export_predictions(
-        loader, model, feature_file, as_half=True, keys=keys, callback_fn=callback_fn
-    )
+    export_predictions(loader, model, feature_file, as_half=True, keys=keys, callback_fn=callback_fn)
 
 
 if __name__ == "__main__":
@@ -148,12 +161,20 @@ if __name__ == "__main__":
     parser.add_argument("--scenes", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--export_sparse_depth", action="store_true")
+    parser.add_argument("--export_path", type=str, default=None)
     args = parser.parse_args()
 
     export_name = configs[args.method]["name"]
 
     data_root = Path(DATA_PATH, "megadepth/Undistorted_SfM")
-    export_root = Path(DATA_PATH, "exports", "megadepth-undist-depth-" + export_name)
+    export_path = DATA_PATH if args.export_path is None else Path(args.export_path)
+
+    export_root = Path(
+        export_path,
+        "exports",
+        "megadepth-undist-depth-" + export_name,
+        args.export_prefix,
+    )
     export_root.mkdir(parents=True, exist_ok=True)
 
     if args.scenes is None:

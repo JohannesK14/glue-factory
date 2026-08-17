@@ -10,6 +10,7 @@ import re
 import shutil
 from pathlib import Path
 
+import omegaconf
 import torch
 from omegaconf import OmegaConf
 
@@ -17,6 +18,21 @@ from .. import settings
 from ..models import get_model
 
 logger = logging.getLogger(__name__)
+
+
+def get_flattened_wandb_cfg(conf_dict):
+    flattened = {}
+
+    def _flatten(cfg, prefix=""):
+        for k, v in cfg.items():
+            new_key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, omegaconf.dictconfig.DictConfig):
+                _flatten(v, new_key)
+            else:
+                flattened[new_key] = v
+
+    _flatten(conf_dict)
+    return flattened
 
 
 def list_checkpoints(dir_):
@@ -62,10 +78,11 @@ def delete_old_checkpoints(dir_, num_keep):
             kept += 1
 
 
-def load_experiment(
-    exper, conf={}, get_last=False, ckpt=None, weights_only=settings.ALLOW_PICKLE
-):
+def load_experiment(exper, conf=None, get_last=False, ckpt=None, weights_only=settings.ALLOW_PICKLE):
     """Load and return the model of a given experiment."""
+    if conf is None:
+        conf = {}
+
     exper = Path(exper)
     if exper.suffix != ".tar":
         if get_last:
@@ -107,6 +124,7 @@ def save_experiment(
     stop=False,
     distributed=False,
     cp_name=None,
+    overwrite_old_best=False,
 ):
     """Save the current model to a checkpoint
     and return the best result so far."""
@@ -120,13 +138,11 @@ def save_experiment(
         "eval": results,
     }
     if cp_name is None:
-        cp_name = (
-            f"checkpoint_{epoch}_{iter_i}" + ("_interrupted" if stop else "") + ".tar"
-        )
+        cp_name = f"checkpoint_{epoch}_{iter_i}" + ("_interrupted" if stop else "") + ".tar"
     logger.info(f"Saving checkpoint {cp_name}")
     cp_path = str(output_dir / cp_name)
     torch.save(checkpoint, cp_path)
-    if cp_name != "checkpoint_best.tar" and results[conf.train.best_key] < best_eval:
+    if cp_name != "checkpoint_best.tar" and overwrite_old_best and results[conf.train.best_key] < best_eval:
         best_eval = results[conf.train.best_key]
         logger.info(f"New best val: {conf.train.best_key}={best_eval}")
         shutil.copy(cp_path, str(output_dir / "checkpoint_best.tar"))

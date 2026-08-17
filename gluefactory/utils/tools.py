@@ -76,15 +76,8 @@ class PRMetric:
     @torch.no_grad()
     def update(self, labels, predictions, mask=None):
         assert labels.shape == predictions.shape
-        self.labels += (
-            (labels[mask] if mask is not None else labels).cpu().numpy().tolist()
-        )
-        self.predictions += (
-            (predictions[mask] if mask is not None else predictions)
-            .cpu()
-            .numpy()
-            .tolist()
-        )
+        self.labels += (labels[mask] if mask is not None else labels).cpu().numpy().tolist()
+        self.predictions += (predictions[mask] if mask is not None else predictions).cpu().numpy().tolist()
 
     @torch.no_grad()
     def compute(self):
@@ -112,7 +105,10 @@ class QuantileMetric:
 
 
 class RecallMetric:
-    def __init__(self, ths, elements=[]):
+    def __init__(self, ths, elements=None):
+        if elements is None:
+            elements = []
+
         self._elements = elements
         self.ths = ths
 
@@ -250,11 +246,7 @@ def set_random_state(state):
     torch.set_rng_state(pth_state)
     np.random.set_state(np_state)
     random.setstate(py_state)
-    if (
-        cuda_state is not None
-        and torch.cuda.is_available()
-        and len(cuda_state) == torch.cuda.device_count()
-    ):
+    if cuda_state is not None and torch.cuda.is_available() and len(cuda_state) == torch.cuda.device_count():
         torch.cuda.set_rng_state_all(cuda_state)
 
 
@@ -267,3 +259,15 @@ def fork_rng(seed=None, with_cuda=True):
         yield
     finally:
         set_random_state(state)
+
+
+def is_new_best_value(mode: str, old_val: float, new_val: float):
+    assert mode in ["higher", "lower"], f"mode must be either 'higher' or 'lower' not {mode}"
+
+    if old_val is None:
+        return True
+
+    if mode == "higher":
+        return new_val > old_val
+    else:
+        return new_val < old_val

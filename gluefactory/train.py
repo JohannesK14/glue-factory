@@ -2,10 +2,24 @@
 A generic training script that works with any model and dataset.
 
 Author: Paul-Edouard Sarlin (skydes)
+
+My changes:
+- removal/ deactivation tqdm
+- integration of wandb for logging
+- overfit overwrites val dataset with train dataset and disables shuffling, for debugging purposes
+- directly loading weight file
+- logging in separte directory in slurm environments
+- fp penalty integrated
+- early stopping based on benchmark results to prevent training collapse
+- lr warump + cosine decay scheduler
+- temperature annealing for RL_LightGlue matchers
+- checkpoint saving depending on test eval results rather than val loss
 """
 
 import argparse
 import copy
+from datetime import timedelta
+import os
 import re
 import shutil
 import signal
@@ -15,25 +29,21 @@ from pydoc import locate
 
 import numpy as np
 import torch
+from dotenv import load_dotenv
 from omegaconf import OmegaConf
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+import wandb
 
 from . import __module_name__, logger, settings
 from .datasets import get_dataset
 from .eval import run_benchmark
 from .models import get_model
-from .utils.experiments import get_best_checkpoint, get_last_checkpoint, save_experiment
+from .utils.experiments import get_best_checkpoint, get_flattened_wandb_cfg, get_last_checkpoint, save_experiment
+from .utils.scheduler import LinearWithPlateaus
 from .utils.stdout_capturing import capture_outputs
 from .utils.tensor import batch_to_device
-from .utils.tools import (
-    AverageMetric,
-    MedianMetric,
-    PRMetric,
-    RecallMetric,
-    fork_rng,
-    set_seed,
-)
+from .utils.tools import AverageMetric, MedianMetric, PRMetric, RecallMetric, fork_rng, is_new_best_value, set_seed
 
 # @TODO: Fix pbar pollution in logs
 # @TODO: add plotting during evaluation
@@ -64,13 +74,22 @@ default_train_conf = {
     "median_metrics": [],  # add the median of some metrics
     "recall_metrics": {},  # add the recall of some metrics
     "pr_metrics": {},  # add pr curves, set labels/predictions/mask keys
-    "best_key": "loss/total",  # key to use to select the best checkpoint
+    "best_key_val": "loss/total",  # key to use to select the best checkpoint (format: benchmark_name/metric for test-based, metric for val-based)
+    "metric_direction": "higher",  # if either higher or lower value of metric is better
+    "select_by_test": True,  # if True, use test/benchmark results for best model selection; if False, use validation
     "dataset_callback_fn": None,  # data func called at the start of each epoch
     "dataset_callback_on_val": False,  # call data func on val data?
     "clip_grad": None,
     "pr_curves": {},
     "plot": None,
     "submodules": [],
+    "curriculum_learning": {
+        "enabled": False,
+        "topk_init": 30,  # initial % of batch to use
+        "topk_max": 80,  # max % of batch
+        "topk_increment": 2.5,  # increase by this % every N epochs
+        "increment_every_n_epochs": 1,
+    },
 }
 default_train_conf = OmegaConf.create(default_train_conf)
 
@@ -84,9 +103,7 @@ def do_evaluation(model, loader, device, loss_fn, conf, rank, pbar=True):
     if conf.plot is not None:
         n, plot_fn = conf.plot
         plot_ids = np.random.choice(len(loader), min(len(loader), n), replace=False)
-    for i, data in enumerate(
-        tqdm(loader, desc="Evaluation", ascii=True, disable=not pbar)
-    ):
+    for i, data in enumerate(tqdm(loader, desc="Evaluation", ascii=True, disable=not pbar)):
         data = batch_to_device(data, device, non_blocking=True)
         with torch.no_grad():
             pred = model(data)
@@ -141,9 +158,19 @@ def filter_parameters(params, regexp):
     return params
 
 
+def get_weight_scheduler(steps_total):
+    return LinearWithPlateaus(
+        start_val=0.0,
+        end_val=1.0,
+        steps_total=steps_total,
+        rel_length_start_plateau=0.0,
+        rel_length_end_plateau=0.667,
+    )
+
+
 def get_lr_scheduler(optimizer, conf):
     """Get lr scheduler specified by conf.train.lr_schedule."""
-    if conf.type not in ["factor", "exp", None]:
+    if conf.type not in ["factor", "exp", "warmup+cosine_decay", None]:
         if hasattr(conf.options, "schedulers"):
             # Add option to chain multiple schedulers together
             # This is useful for e.g. warmup, then cosine decay
@@ -153,11 +180,28 @@ def get_lr_scheduler(optimizer, conf):
                 schedulers.append(scheduler)
 
             options = {k: v for k, v in conf.options.items() if k != "schedulers"}
-            return getattr(torch.optim.lr_scheduler, conf.type)(
-                optimizer, schedulers, **options
-            )
+            return getattr(torch.optim.lr_scheduler, conf.type)(optimizer, schedulers, **options)
 
         return getattr(torch.optim.lr_scheduler, conf.type)(optimizer, **conf.options)
+
+    if conf.type == "warmup+cosine_decay":
+        warmup_epochs = conf.get("warmup_epochs", 10)
+        total_epochs = conf.get("total_epochs", 50)
+        scheduler1 = torch.optim.lr_scheduler.LinearLR(
+            optimizer=optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=total_epochs - warmup_epochs,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer=optimizer,
+            schedulers=[scheduler1, scheduler2],
+            milestones=[warmup_epochs],
+        )
 
     # backward compatibility
     def lr_fn(it):  # noqa: E306
@@ -176,7 +220,7 @@ def get_lr_scheduler(optimizer, conf):
 
 def pack_lr_parameters(params, base_lr, lr_scaling):
     """Pack each group of parameters with the respective scaled learning rate."""
-    filters, scales = tuple(zip(*[(n, s) for s, names in lr_scaling for n in names]))
+    filters, scales = tuple(zip(*[(n, s) for s, names in lr_scaling for n in names], strict=False))
     scale2params = defaultdict(list)
     for n, p in params:
         scale = 1
@@ -189,76 +233,94 @@ def pack_lr_parameters(params, base_lr, lr_scaling):
         "Parameters with scaled learning rate:\n%s",
         {s: [n for n, _ in ps] for s, ps in scale2params.items() if s != 1},
     )
-    lr_params = [
-        {"lr": scale * base_lr, "params": [p for _, p in ps]}
-        for scale, ps in scale2params.items()
-    ]
+    lr_params = [{"lr": scale * base_lr, "params": [p for _, p in ps]} for scale, ps in scale2params.items()]
     return lr_params
 
 
-def write_dict_summaries(writer, name, items, step):
+def write_dict_summaries(_writer_unused, name, items, step):
+    """Log (possibly nested) scalar dictionaries to wandb.
+    Keeps original signature (first arg ignored) for minimal invasive change.
+    """
+    flat = {}
     for k, v in items.items():
-        key = f"{name}/{k}"
+        key = f"{name}/{k}" if name else k
         if isinstance(v, dict):
-            writer.add_scalars(key, v, step)
-        elif isinstance(v, tuple):
-            writer.add_pr_curve(key, *v, step)
+            for sk, sv in v.items():
+                if torch.is_tensor(sv):
+                    sv = sv.detach().cpu().item() if sv.numel() == 1 else sv.detach().cpu().numpy()
+                flat[f"{key}/{sk}"] = sv
+        elif isinstance(v, (tuple, list)):
+            # Skip complex objects (e.g., PR curve raw data) or log simple summary
+            continue
         else:
-            writer.add_scalar(key, v, step)
+            if torch.is_tensor(v):
+                v = v.detach().cpu().item() if v.numel() == 1 else v.detach().cpu().numpy()
+            flat[key] = v
+    if flat:
+        wandb.log(flat, step=step)
 
 
-def write_image_summaries(writer, name, figures, step):
+def write_image_summaries(_writer_unused, name, figures, step):
+    """Log matplotlib figures to wandb as images (retaining old call signature)."""
+    logs = {}
     if isinstance(figures, list):
         for i, figs in enumerate(figures):
             for k, fig in figs.items():
-                writer.add_figure(f"{name}/{i}_{k}", fig, step)
-    else:
+                logs[f"{name}/{i}_{k}"] = wandb.Image(fig)
+    elif isinstance(figures, dict):
         for k, fig in figures.items():
-            writer.add_figure(f"{name}/{k}", fig, step)
+            logs[f"{name}/{k}"] = wandb.Image(fig)
+    if logs:
+        wandb.log(logs, step=step)
 
 
 def training(rank, conf, output_dir, args):
     if args.restore:
-        logger.info(f"Restoring from previous training of {args.experiment}")
-        try:
-            init_cp = get_last_checkpoint(args.experiment, allow_interrupted=False)
-        except AssertionError:
-            init_cp = get_best_checkpoint(args.experiment)
-        logger.info(f"Restoring from checkpoint {init_cp.name}")
-        init_cp = torch.load(
-            str(init_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE
+        previous_experiment = (
+            conf.train.run_from_previous if conf.train.run_from_previous is not None else args.experiment
         )
+
+        logger.info(f"Restoring from previous training of {previous_experiment}")
+        try:
+            init_cp = get_last_checkpoint(previous_experiment, allow_interrupted=False)
+        except AssertionError:
+            init_cp = get_best_checkpoint(previous_experiment)
+        logger.info(f"Restoring from checkpoint {init_cp.name}")
+        init_cp = torch.load(str(init_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE)
         conf = OmegaConf.merge(OmegaConf.create(init_cp["conf"]), conf)
         conf.train = OmegaConf.merge(default_train_conf, conf.train)
         epoch = init_cp["epoch"] + 1
 
-        # get the best loss or eval metric from the previous best checkpoint
-        best_cp = get_best_checkpoint(args.experiment)
-        best_cp = torch.load(
-            str(best_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE
-        )
-        best_eval = best_cp["eval"][conf.train.best_key]
-        del best_cp
+        try:
+            # get the best loss or eval metric from the previous best checkpoint
+            best_cp = get_best_checkpoint(previous_experiment)
+            best_cp = torch.load(str(best_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE)
+            best_eval = best_cp["eval"][conf.train.best_key_test]
+            del best_cp
+        except FileNotFoundError:
+            best_eval = None
+            logger.warning("Could not find best checkpoint, setting best_eval to None.")
     else:
         # we start a new, fresh training
         conf.train = OmegaConf.merge(default_train_conf, conf.train)
         epoch = 0
-        best_eval = float("inf")
+        best_eval = None
         if conf.train.load_experiment:
-            logger.info(f"Will fine-tune from weights of {conf.train.load_experiment}")
-            # the user has to make sure that the weights are compatible
-            try:
-                init_cp = get_last_checkpoint(conf.train.load_experiment)
-            except AssertionError:
-                init_cp = get_best_checkpoint(conf.train.load_experiment)
-            # init_cp = get_last_checkpoint(conf.train.load_experiment)
-            init_cp = torch.load(
-                str(init_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE
-            )
+            if (Path(conf.train.load_experiment)).is_file():
+                logger.info(f"Will fine-tune from checkpoint file {conf.train.load_experiment}")
+                init_cp = Path(conf.train.load_experiment)
+            else:
+                logger.info(f"Will fine-tune from weights of {conf.train.load_experiment}")
+                # the user has to make sure that the weights are compatible
+                try:
+                    init_cp = get_last_checkpoint(conf.train.load_experiment)
+                except AssertionError:
+                    init_cp = get_best_checkpoint(conf.train.load_experiment)
+                # init_cp = get_last_checkpoint(conf.train.load_experiment)
+            logger.info(f"Restoring from checkpoint {init_cp}")
+            init_cp = torch.load(str(init_cp), map_location="cpu", weights_only=not settings.ALLOW_PICKLE)
             # load the model config of the old setup, and overwrite with current config
-            conf.model = OmegaConf.merge(
-                OmegaConf.create(init_cp["conf"]).model, conf.model
-            )
+            conf.model = OmegaConf.merge(OmegaConf.create(init_cp["conf"]).model, conf.model)
             print(conf.model)
         else:
             init_cp = None
@@ -266,7 +328,13 @@ def training(rank, conf, output_dir, args):
     OmegaConf.set_struct(conf, True)  # prevent access to unknown entries
     set_seed(conf.train.seed)
     if rank == 0:
-        writer = SummaryWriter(log_dir=str(output_dir))
+        wandb.init(
+            project=conf.train.logger.project_name,
+            name=conf.train.logger.experiment_name + "_" + os.environ.get("SLURM_JOB_ID", "NO_ID"),
+            config=get_flattened_wandb_cfg(conf),
+            dir=str(settings.WANDB_PATH),
+            mode=conf.train.logger.mode,
+        )
 
     data_conf = copy.deepcopy(conf.data)
     if args.distributed:
@@ -278,6 +346,7 @@ def training(rank, conf, output_dir, args):
             world_size=args.n_gpus,
             rank=device,
             init_method="file://" + str(args.lock_file),
+            timeout=timedelta(minutes=60),
         )
         torch.cuda.set_device(device)
 
@@ -287,9 +356,7 @@ def training(rank, conf, output_dir, args):
         if "train_batch_size" in data_conf:
             data_conf.train_batch_size = int(data_conf.train_batch_size / args.n_gpus)
         if "num_workers" in data_conf:
-            data_conf.num_workers = int(
-                (data_conf.num_workers + args.n_gpus - 1) / args.n_gpus
-            )
+            data_conf.num_workers = int((data_conf.num_workers + args.n_gpus - 1) / args.n_gpus)
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device {device}")
@@ -298,7 +365,9 @@ def training(rank, conf, output_dir, args):
 
     # Optionally load a different validation dataset than the training one
     val_data_conf = conf.get("data_val", None)
-    if val_data_conf is None:
+    if val_data_conf is None or args.overfit:
+        if val_data_conf is not None:
+            logger.warning("Overfitting mode: using training data for validation IGNORING val_data_conf")
         val_dataset = dataset
     else:
         val_dataset = get_dataset(val_data_conf.name)(val_data_conf)
@@ -356,9 +425,7 @@ def training(rank, conf, output_dir, args):
     all_params = [p for n, p in params]
 
     lr_params = pack_lr_parameters(params, conf.train.lr, conf.train.lr_scaling)
-    optimizer = optimizer_fn(
-        lr_params, lr=conf.train.lr, **conf.train.optimizer_options
-    )
+    optimizer = optimizer_fn(lr_params, lr=conf.train.lr, **conf.train.optimizer_options)
     use_mp = args.mixed_precision is not None
     scaler = (
         torch.amp.GradScaler("cuda", enabled=use_mp)
@@ -382,9 +449,7 @@ def training(rank, conf, output_dir, args):
             lr_scheduler.load_state_dict(init_cp["lr_scheduler"])
 
     if rank == 0:
-        logger.info(
-            "Starting training with configuration:\n%s", OmegaConf.to_yaml(conf)
-        )
+        logger.info("Starting training with configuration:\n%s", OmegaConf.to_yaml(conf))
 
     def trace_handler(p):
         # torch.profiler.tensorboard_trace_handler(str(output_dir))
@@ -402,31 +467,106 @@ def training(rank, conf, output_dir, args):
             with_stack=True,
         )
         prof.__enter__()
+
+    overall_n_samples = conf.train.epochs * len(train_loader) * (args.n_gpus if args.distributed else 1)
+    if not args.log_it:
+        overall_n_samples *= train_loader.batch_size
+
+    alpha_scheduler = get_weight_scheduler(overall_n_samples)
+
+    curriculum_conf = conf.train.curriculum_learning
+    curriculum_enabled = curriculum_conf.enabled
+    if curriculum_enabled:
+        topK = curriculum_conf.topk_init
+        logger.info(
+            f"Curriculum learning enabled: topK={topK}%, max={curriculum_conf.topk_max}%, "
+            f"increment={curriculum_conf.topk_increment}% every {curriculum_conf.increment_every_n_epochs} epochs"
+        )
+    else:
+        topK = 100
+
     while epoch < conf.train.epochs and not stop:
         if rank == 0:
             logger.info(f"Starting epoch {epoch}")
 
+        # set temperature in RL_LightGlue matchers
+        if conf.model.matcher.name == "matchers.rl_lightglue" and conf.train.anneal_softmax_temperature.do:
+            diff_end_start = conf.train.anneal_softmax_temperature.end - conf.train.anneal_softmax_temperature.start
+            inclination = 1.0 / conf.train.anneal_softmax_temperature.epochs
+            temperature = conf.train.anneal_softmax_temperature.start + diff_end_start * min(1.0, inclination * epoch)
+
+            unwrapped = model.module if hasattr(model, "module") else model
+            unwrapped.matcher.set_softmax_temperature_matcher(temperature)
+            if rank == 0:
+                logger.info(f"Setting RL_LightGlue matcher softmax temperature to {temperature:.3f}")
+
         # we first run the eval
-        if (
-            rank == 0
-            and epoch % conf.train.test_every_epoch == 0
-            and args.run_benchmarks
-        ):
+        if rank == 0 and epoch % conf.train.test_every_epoch == 0 and args.run_benchmarks:
+            tot_it = (len(train_loader) * epoch) * (args.n_gpus if args.distributed else 1)
+            tot_n_samples = tot_it
+            if not args.log_it:
+                # We normalize the x-axis of tensorflow to num samples!
+                tot_n_samples *= train_loader.batch_size
+
+            # Store benchmark results for best model selection
+            benchmark_results = {}
             for bname, eval_conf in conf.get("benchmarks", {}).items():
                 logger.info(f"Running eval on {bname}")
+                # Use unwrapped model to avoid DDP collectives during rank-0-only eval
+                eval_model = model.module if hasattr(model, "module") else model
                 summaries, figures, _ = run_benchmark(
                     bname,
                     eval_conf,
                     settings.EVAL_PATH / bname / args.experiment / str(epoch),
-                    model.eval(),
+                    eval_model.eval(),
                 )
-                str_summaries = [
-                    f"{k} {v:.3E}" for k, v in summaries.items() if isinstance(v, float)
-                ]
-                logger.info(f'[{bname}] {{{", ".join(str_summaries)}}}')
-                write_dict_summaries(writer, f"test/{bname}", summaries, epoch)
-                write_image_summaries(writer, f"figures/{bname}", figures, epoch)
+                str_summaries = [f"{k} {v:.3E}" for k, v in summaries.items() if isinstance(v, float)]
+                logger.info(f"[{bname}] {{{', '.join(str_summaries)}}}")
+                write_dict_summaries(None, f"test/{bname}", summaries, tot_n_samples)
+                write_image_summaries(None, f"figures/{bname}", figures, tot_n_samples)
+
+                # Store results for checkpoint saving
+                benchmark_results.update({f"{bname}/{k}": v for k, v in summaries.items()})
+
+                # early stopping based on benchmark results
+                if summaries["rel_pose_error@5°"] < 0.05:
+                    logger.info(
+                        f"Training apparently collapsed, stopping. Rel pose error@5°={summaries['rel_pose_error@5°']}"
+                    )
+                    stop = True
+
                 del summaries, figures
+
+            # Save best checkpoint based on benchmark results if test-based selection is enabled
+            if conf.train.select_by_test and benchmark_results:
+                if conf.train.best_key_test not in benchmark_results:
+                    raise RuntimeError(
+                        f"{conf.train.best_key_test} not in benchmark_results dict! Available keys: {benchmark_results.keys()}"
+                    )
+
+                if is_new_best_value(
+                    conf.train.metric_direction, best_eval, benchmark_results[conf.train.best_key_test]
+                ):
+                    best_eval = benchmark_results[conf.train.best_key_test]
+                    save_experiment(
+                        model,
+                        optimizer,
+                        lr_scheduler,
+                        conf,
+                        benchmark_results,
+                        best_eval,
+                        epoch,
+                        tot_it,
+                        output_dir,
+                        stop,
+                        args.distributed,
+                        cp_name="checkpoint_best_test.tar",
+                    )
+                    logger.info(f"New best test: {conf.train.best_key_test}={best_eval}")
+
+        # synchronize all ranks after evaluation (rank 0 may have run benchmarks)
+        if args.distributed:
+            torch.distributed.barrier()
 
         # set the seed
         set_seed(conf.train.seed + epoch)
@@ -435,9 +575,7 @@ def training(rank, conf, output_dir, args):
         if conf.train.lr_schedule.on_epoch and epoch > 0:
             old_lr = optimizer.param_groups[0]["lr"]
             lr_scheduler.step()
-            logger.info(
-                f'lr changed from {old_lr} to {optimizer.param_groups[0]["lr"]}'
-            )
+            logger.info(f"lr changed from {old_lr} to {optimizer.param_groups[0]['lr']}")
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
         if epoch > 0 and conf.train.dataset_callback_fn and not args.overfit:
@@ -446,21 +584,21 @@ def training(rank, conf, output_dir, args):
                 loaders += [val_loader]
             for loader in loaders:
                 if isinstance(loader.dataset, torch.utils.data.Subset):
-                    getattr(loader.dataset.dataset, conf.train.dataset_callback_fn)(
-                        conf.train.seed + epoch
-                    )
+                    getattr(loader.dataset.dataset, conf.train.dataset_callback_fn)(conf.train.seed + epoch)
                 else:
-                    getattr(loader.dataset, conf.train.dataset_callback_fn)(
-                        conf.train.seed + epoch
-                    )
+                    getattr(loader.dataset, conf.train.dataset_callback_fn)(conf.train.seed + epoch)
+
         for it, data in enumerate(train_loader):
-            tot_it = (len(train_loader) * epoch + it) * (
-                args.n_gpus if args.distributed else 1
-            )
+            tot_it = (len(train_loader) * epoch + it) * (args.n_gpus if args.distributed else 1)
             tot_n_samples = tot_it
             if not args.log_it:
                 # We normalize the x-axis of tensorflow to num samples!
                 tot_n_samples *= train_loader.batch_size
+
+            alpha = alpha_scheduler(tot_n_samples)
+            if conf.model.matcher.name == "matchers.rl_lightglue":
+                unwrapped = model.module if hasattr(model, "module") else model
+                unwrapped.matcher.loss_fn.update_alpha(alpha)
 
             model.train()
             optimizer.zero_grad()
@@ -473,7 +611,22 @@ def training(rank, conf, output_dir, args):
                 data = batch_to_device(data, device, non_blocking=True)
                 pred = model(data)
                 losses, _ = loss_fn(pred, data)
-                loss = torch.mean(losses["total"])
+                if curriculum_enabled and "sum_rewards" in losses:
+                    rewards = losses["sum_rewards"].detach()
+                    B = rewards.shape[0]
+                    select_k = max(int(B * topK / 100), 1)
+                    sorted_rewards, _ = torch.sort(rewards, descending=True)
+                    threshold = sorted_rewards[min(select_k - 1, B - 1)]
+                    mask = (rewards >= threshold).float()
+                    num_selected = mask.sum()
+                    curriculum_num_selected = num_selected.item()
+                    if curriculum_num_selected > 0:
+                        loss = (losses["total"] * mask).sum() / num_selected
+                    else:
+                        loss = torch.mean(losses["total"])
+                else:
+                    curriculum_num_selected = -1
+                    loss = torch.mean(losses["total"])
             if torch.isnan(loss).any():
                 print(f"Detected NAN, skipping iteration {it}")
                 del pred, data, loss, losses
@@ -482,9 +635,7 @@ def training(rank, conf, output_dir, args):
             do_backward = loss.requires_grad
             if args.distributed:
                 do_backward = torch.tensor(do_backward).float().to(device)
-                torch.distributed.all_reduce(
-                    do_backward, torch.distributed.ReduceOp.PRODUCT
-                )
+                torch.distributed.all_reduce(do_backward, torch.distributed.ReduceOp.PRODUCT)
                 do_backward = do_backward > 0
             if do_backward:
                 scaler.scale(loss).backward()
@@ -532,38 +683,44 @@ def training(rank, conf, output_dir, args):
                     losses[k] = losses[k].item()
                 if rank == 0:
                     str_losses = [f"{k} {v:.3E}" for k, v in losses.items()]
-                    logger.info(
-                        "[E {} | it {}] loss {{{}}}".format(
-                            epoch, it, ", ".join(str_losses)
-                        )
-                    )
-                    write_dict_summaries(writer, "training/", losses, tot_n_samples)
-                    writer.add_scalar(
-                        "training/lr", optimizer.param_groups[0]["lr"], tot_n_samples
-                    )
-                    writer.add_scalar("training/epoch", epoch, tot_n_samples)
+                    logger.info("[E {} | it {}] loss {{{}}}".format(epoch, it, ", ".join(str_losses)))
+                    write_dict_summaries(None, "training", losses, tot_n_samples)
+                    log_dict = {
+                        "training/lr": optimizer.param_groups[0]["lr"],
+                        "training/epoch": epoch,
+                        "training/alpha": alpha,
+                        "training/softmax_temp": (
+                            (
+                                model.module if hasattr(model, "module") else model
+                            ).matcher.get_softmax_temperature_matcher()
+                            if conf.model.matcher.name == "matchers.rl_lightglue"
+                            else -1.0
+                        ),
+                    }
+                    if curriculum_enabled:
+                        log_dict["training/curriculum_topK"] = topK
+                        log_dict["training/curriculum_selected"] = curriculum_num_selected
+                    wandb.log(log_dict, step=tot_n_samples)
 
             if conf.train.log_grad_every_iter is not None:
                 if it % conf.train.log_grad_every_iter == 0:
-                    grad_txt = ""
-                    for name, param in model.named_parameters():
-                        if param.grad is not None and param.requires_grad:
-                            if name.endswith("bias"):
-                                continue
-                            writer.add_histogram(
-                                f"grad/{name}", param.grad.detach(), tot_n_samples
-                            )
-                            norm = torch.norm(param.grad.detach(), 2)
-                            grad_txt += f"{name} {norm.item():.3f}  \n"
-                    writer.add_text("grad/summary", grad_txt, tot_n_samples)
+                    if rank == 0:
+                        grad_logs = {}
+                        grad_txt = ""
+                        for name, param in model.named_parameters():
+                            if param.grad is not None and param.requires_grad and not name.endswith("bias"):
+                                g = param.grad.detach().float().cpu().view(-1)
+                                grad_logs[f"grad/{name}"] = wandb.Histogram(g.numpy())
+                                norm = torch.norm(param.grad.detach(), 2).item()
+                                grad_txt += f"{name} {norm:.3f}\n"
+                        if grad_logs:
+                            grad_logs["grad/summary_txt"] = grad_txt
+                            wandb.log(grad_logs, step=tot_n_samples)
             del pred, data, loss, losses
 
             # Run validation
             if (
-                (
-                    it % conf.train.eval_every_iter == 0
-                    and (it > 0 or epoch == -int(args.no_eval_0))
-                )
+                (it % conf.train.eval_every_iter == 0 and (it > 0 or epoch == -int(args.no_eval_0)))
                 or stop
                 or it == (len(train_loader) - 1)
             ):
@@ -579,33 +736,31 @@ def training(rank, conf, output_dir, args):
                     )
 
                 if rank == 0:
-                    str_results = [
-                        f"{k} {v:.3E}"
-                        for k, v in results.items()
-                        if isinstance(v, float)
-                    ]
-                    logger.info(f'[Validation] {{{", ".join(str_results)}}}')
-                    write_dict_summaries(writer, "val", results, tot_n_samples)
-                    write_dict_summaries(writer, "val", pr_metrics, tot_n_samples)
-                    write_image_summaries(writer, "figures", figures, tot_n_samples)
-                    # @TODO: optional always save checkpoint
-                    if results[conf.train.best_key] < best_eval:
-                        best_eval = results[conf.train.best_key]
-                        save_experiment(
-                            model,
-                            optimizer,
-                            lr_scheduler,
-                            conf,
-                            results,
-                            best_eval,
-                            epoch,
-                            tot_it,
-                            output_dir,
-                            stop,
-                            args.distributed,
-                            cp_name="checkpoint_best.tar",
-                        )
-                        logger.info(f"New best val: {conf.train.best_key}={best_eval}")
+                    str_results = [f"{k} {v:.3E}" for k, v in results.items() if isinstance(v, float)]
+                    logger.info(f"[Validation] {{{', '.join(str_results)}}}")
+                    write_dict_summaries(None, "val", results, tot_n_samples)
+                    write_dict_summaries(None, "val_pr", pr_metrics, tot_n_samples)
+                    write_image_summaries(None, "figures", figures, tot_n_samples)
+                    # Save best checkpoint based on validation if validation-based selection is enabled
+                    if not conf.train.select_by_test:
+                        if is_new_best_value(conf.train.metric_direction, best_eval, results[conf.train.best_key_val]):
+                            best_eval = results[conf.train.best_key_val]
+                            save_experiment(
+                                model,
+                                optimizer,
+                                lr_scheduler,
+                                conf,
+                                results,
+                                best_eval,
+                                epoch,
+                                tot_it,
+                                output_dir,
+                                stop,
+                                args.distributed,
+                                cp_name="checkpoint_best.tar",
+                                overwrite_old_best=(not conf.train.select_by_test),
+                            )
+                            logger.info(f"New best val: {conf.train.best_key_val}={best_eval}")
                 torch.cuda.empty_cache()  # should be cleared at the first iter
 
             if (tot_it % conf.train.save_every_iter == 0 and tot_it > 0) and rank == 0:
@@ -619,7 +774,7 @@ def training(rank, conf, output_dir, args):
                         rank,
                         pbar=(rank == 0),
                     )
-                    best_eval = results[conf.train.best_key]
+                    best_eval = results[conf.train.best_key_val]
                 best_eval = save_experiment(
                     model,
                     optimizer,
@@ -632,6 +787,7 @@ def training(rank, conf, output_dir, args):
                     output_dir,
                     stop,
                     args.distributed,
+                    overwrite_old_best=(not conf.train.select_by_test),
                 )
             if stop:
                 break
@@ -649,21 +805,31 @@ def training(rank, conf, output_dir, args):
                 output_dir=output_dir,
                 stop=stop,
                 distributed=args.distributed,
+                overwrite_old_best=(not conf.train.select_by_test),
             )
 
         results = None  # free memory
+
+        # Curriculum learning: increase topK at epoch boundaries
+        if (
+            curriculum_enabled
+            and topK < curriculum_conf.topk_max
+            and (epoch + 1) % curriculum_conf.increment_every_n_epochs == 0
+        ):
+            topK = min(curriculum_conf.topk_max, topK + curriculum_conf.topk_increment)
+            if rank == 0:
+                logger.info(f"Curriculum learning: topK increased to {topK}%")
+
         epoch += 1
 
     logger.info(f"Finished training on process {rank}.")
     if rank == 0:
-        writer.close()
+        wandb.finish()
 
 
 def main_worker(rank, conf, output_dir, args):
     if rank == 0:
-        with capture_outputs(
-            output_dir / "log.txt", cleanup_interval=args.cleanup_interval
-        ):
+        with capture_outputs(output_dir / "log.txt", cleanup_interval=args.cleanup_interval):
             training(rank, conf, output_dir, args)
     else:
         training(rank, conf, output_dir, args)
@@ -703,8 +869,18 @@ if __name__ == "__main__":
     parser.add_argument("dotlist", nargs="*")
     args = parser.parse_intermixed_args()
 
+    load_dotenv(".env")
+
     logger.info(f"Starting experiment {args.experiment}")
-    output_dir = Path(settings.TRAINING_PATH, args.experiment)
+
+    exp_subdir = ""
+    if "SLURM_JOB_ID" in os.environ:
+        logger.info(f"SLURM job id: {os.environ['SLURM_JOB_ID']}")
+        exp_subdir = os.environ["SLURM_JOB_ID"]
+    else:
+        exp_subdir = "DESKTOP"
+
+    output_dir = Path(settings.TRAINING_PATH, args.experiment, exp_subdir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
     conf = OmegaConf.from_cli(args.dotlist)
@@ -729,8 +905,6 @@ if __name__ == "__main__":
         args.lock_file = output_dir / "distributed_lock"
         if args.lock_file.exists():
             args.lock_file.unlink()
-        torch.multiprocessing.spawn(
-            main_worker, nprocs=args.n_gpus, args=(conf, output_dir, args)
-        )
+        torch.multiprocessing.spawn(main_worker, nprocs=args.n_gpus, args=(conf, output_dir, args))
     else:
         main_worker(0, conf, output_dir, args)

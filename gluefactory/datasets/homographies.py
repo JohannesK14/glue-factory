@@ -298,7 +298,10 @@ def visualize(args):
             )
     plot_image_grid(images, dpi=args.dpi)
     plt.tight_layout()
-    plt.show()
+    # plt.show()
+    # save instead of showing
+    plt.savefig("homography_dataset_visualization.png", dpi=args.dpi)
+    logger.info("Saved visualization to homography_dataset_visualization.png")
 
 
 if __name__ == "__main__":

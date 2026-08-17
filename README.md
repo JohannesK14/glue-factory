@@ -1,10 +1,16 @@
-# RIPE Evaluation with the Glue Factory
+# Extension Glue-Factory
 
-This is a fork of the [GlueFactory](https://github.com/cvg/glue-factory) repository with [RIPE](https://github.com/fraunhoferhhi/RIPE) integrated for evaluation.
+This is a fork of the [GlueFactory](https://github.com/cvg/glue-factory) repository with [RIPE](https://github.com/fraunhoferhhi/RIPE) and [RIPE++](https://github.com/fraunhoferhhi/RIPEpp) integrated.
 
 To ensure reproducibility, this fork uses [uv](https://docs.astral.sh/uv/) to manage the environment.
 
-To evaluate RIPE on MegaDepth1500 and HPatches, run (after installing uv):
+## Evaluation
+
+**Prerequisite:** Install uv.
+
+### MegaDepth1500 + HPatches
+
+**RIPE**
 
 ```bash
 uv sync
@@ -12,14 +18,21 @@ uv run python -m gluefactory.eval.megadepth1500 --conf ripe+NN
 uv run python -m gluefactory.eval.hpatches --conf ripe+NN
 ```
 
-For RIPE++
+**RIPE++**
 ```bash
 uv sync
 uv run python -m gluefactory.eval.megadepth1500 --conf ripepp+NN
 uv run python -m gluefactory.eval.hpatches --conf ripepp+NN
 ```
 
-Recreate SCARED1500:
+**RIPE++ + LightGlue**
+```bash
+
+```
+
+### SCARED1500
+
+**Recreate SCARED1500:**
 1. Download SCARED (write an e-mail to max.allan@intusurg.com)
 2. Use the preprocessing scripts from https://github.com/fraunhoferhhi/RIPEpp
 3. Recreate the dataset with:
@@ -34,7 +47,46 @@ It is also possible to create a new evaluation dataset with `gluefactory/scripts
 uv run python -m gluefactory.eval.scared1500 --conf ripepp+NN model.extractor.variant=scared
 ```
 
-# Glue Factory
+## Training
+
+### RIPE++ LightGlue Training
+
+In general, the training follows the same two-step approach as the original LightGlue training.
+
+#### Homography Pre-Training
+```bash
+uv run python -m gluefactory.train homography_pretraining \
+ --mp bfloat16 \
+#  --distributed
+ --conf gluefactory/configs/ripepp+lightglue_homography.yaml \
+```
+
+#### RL-based Finetuning
+```bash
+python -m gluefactory.train ripepp+lightglue_megadepth_RL \
+ --conf gluefactory/configs/ripepp+lightglue_megadepth_RL.yaml \
+ --run_benchmarks \
+#  --distributed \
+ train.logger.mode=offline
+ train.load_experiment=/path/to/output/of/homography/pretraining \
+```
+
+To speed up the training it is also possible to pre-generate the RIPE++ keypoint locations and descriptors with 
+```bash
+uv run python -m gluefactory.scripts.export_megadepth --method ripepp --num_workers 8 --export_path path/to/export/dir
+```
+and then add 
+```bash
+uv run python -m gluefactory.train \
+...
+data.load_features.do=true \
+path/to/export/dir/megadepth-undist-depth-r1024_RIPEPP-k2048-nms3/{scene}.h5
+```
+
+
+
+
+# Original: Glue Factory
 Glue Factory is CVG's library for training and evaluating deep neural network that extract and match local visual feature. It enables you to:
 - Reproduce the training of state-of-the-art models for point and line matching, like [LightGlue](https://github.com/cvg/LightGlue) and [GlueStick](https://github.com/cvg/GlueStick) (ICCV 2023)
 - Train these models on multiple datasets using your own local features or lines

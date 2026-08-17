@@ -17,6 +17,7 @@ class ImageFolder(BaseDataset, torch.utils.data.Dataset):
         "glob": ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG"],
         "images": "???",
         "root_folder": "/",
+        "grayscale": False,
         "preprocessing": ImagePreprocessor.default_conf,
     }
 
@@ -33,9 +34,7 @@ class ImageFolder(BaseDataset, torch.utils.data.Dataset):
                 for g in glob:
                     self.images += list(Path(conf.images).glob("**/" + g))
                 if len(self.images) == 0:
-                    raise ValueError(
-                        f"Could not find any image in folder: {conf.images}."
-                    )
+                    raise ValueError(f"Could not find any image in folder: {conf.images}.")
                 self.images = [i.relative_to(conf.images) for i in self.images]
                 self.root = conf.images
                 logging.info(f"Found {len(self.images)} images in folder.")
@@ -51,7 +50,7 @@ class ImageFolder(BaseDataset, torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         path = self.images[idx]
-        img = load_image(path)
+        img = load_image(self.root / path, self.conf.grayscale)
         data = {"name": str(path), **self.preprocessor(img)}
         return data
 
