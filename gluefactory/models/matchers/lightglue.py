@@ -352,14 +352,20 @@ class LightGlue(nn.Module):
                     file_name=fname,
                 )
 
-        if not conf.trainable and "model" in state_dict:
+        # A full training checkpoint stores the pipeline weights under "model",
+        # with keys prefixed by "extractor." / "matcher.". Unwrap it so the raw
+        # matcher weights can be loaded. This is independent of `trainable`, which
+        # is not part of this model's conf when instantiated directly (e.g. via
+        # rl_lightglue in the training pipeline).
+        if state_dict is not None and "model" in state_dict:
             state_dict = state_dict["model"]
 
             # go trough state dict and remove all keys beginning with "extractor."
             state_dict = {k: v for k, v in state_dict.items() if "extractor." not in k}
 
             # go trough the state dict and remove leading "matcher." in keys
-            state_dict = {k[8:]: v for k, v in state_dict.items()}
+            prefix = "matcher."
+            state_dict = {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state_dict.items()}
 
         if state_dict:
             # rename old state dict entries
