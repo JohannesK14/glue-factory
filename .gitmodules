@@ -1,6 +1,3 @@
 [submodule "thirdparty/ripe"]
 	path = thirdparty/ripe
 	url = https://github.com/fraunhoferhhi/RIPE.git
-[submodule "thirdparty/ripepp"]
-	path = thirdparty/ripepp
-	url = git@vigitlab.fe.hhi.de:git/CVG_RIPEpp.git

@@ -5,15 +5,6 @@ import torchvision.transforms as transforms
 
 from ..base_model import BaseModel
 
-ripe_path = Path(__file__).parent / "../../../thirdparty/ripepp"
-
-print(f"RIPE++ Path: {ripe_path.resolve()}")
-# check if the path exists
-if not ripe_path.exists():
-    raise RuntimeError(f"RIPE++ path not found: {ripe_path}")
-
-sys.path.append(str(ripe_path))
-
 from ripepp import load_model_from_checkpoint, resolve_variant_checkpoint
 
 
