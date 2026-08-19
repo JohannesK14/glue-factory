@@ -13,22 +13,22 @@ To ensure reproducibility, this fork uses [uv](https://docs.astral.sh/uv/) to ma
 **RIPE**
 
 ```bash
-uv sync
 uv run python -m gluefactory.eval.megadepth1500 --conf ripe+NN
 uv run python -m gluefactory.eval.hpatches --conf ripe+NN
 ```
 
 **RIPE++**
 ```bash
-uv sync
 uv run python -m gluefactory.eval.megadepth1500 --conf ripepp+NN
 uv run python -m gluefactory.eval.hpatches --conf ripepp+NN
 ```
 
 **RIPE++ + LightGlue**
 ```bash
-
+uv run python -m gluefactory.eval.megadepth1500 --conf ripepp+lightglue_eval
+uv run python -m gluefactory.eval.hpatches --conf ripepp+lightglue_eval
 ```
+The matcher checkpoint is resolved automatically: it is looked up in the repo-local `weights/` directory, then the torch hub cache, and downloaded if still missing. To use a specific checkpoint instead, override it with `model.matcher.weights=path/to/ripe++/plus/lightglue.tar`.
 
 ### SCARED1500
 

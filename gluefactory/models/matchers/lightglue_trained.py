@@ -1,5 +1,6 @@
 from omegaconf import OmegaConf
 
+from ...utils.checkpoint import resolve_lightglue_weights
 from ..base_model import BaseModel
 from .lightglue import LightGlue as LightGlue_
 
@@ -16,10 +17,11 @@ class LightGlue(BaseModel):
     ]
 
     def _init(self, conf):
-        print("foobar")
-
         dconf = OmegaConf.to_container(conf)
         dconf["trainable"] = False
+        # Resolve the checkpoint to a concrete local path (downloading if needed)
+        # so the inner LightGlue loads it via its existing path branch.
+        dconf["weights"] = str(resolve_lightglue_weights(dconf.get("weights")))
         self.net = LightGlue_(dconf)
         self.net.eval()
         self.set_initialized()

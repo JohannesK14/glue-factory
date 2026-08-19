@@ -10,7 +10,7 @@ model:
         variant: default
     matcher:
       name: matchers.lightglue_trained
-      weights: null
+      weights: null  # null -> auto-resolve/download the default checkpoint; or set a path/variant
       depth_confidence: -1
       width_confidence: -1
       filter_threshold: 0.1
